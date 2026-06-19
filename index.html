@@ -55,7 +55,7 @@
       .btn--sm{min-height:36px;padding:0 12px;font-size:.88rem}
       .btn:disabled{opacity:.45}
 
-      .stage{flex:1;position:relative;overflow:auto;-webkit-overflow-scrolling:touch}
+      .stage{flex:1;position:relative;overflow:hidden;touch-action:none;background:var(--paper)}
       .preview-note{position:absolute;top:10px;left:10px;right:10px;z-index:5;display:flex;gap:10px;
         background:var(--teal-soft);border:1px solid color-mix(in srgb,var(--teal) 22%,transparent);
         border-radius:var(--r);padding:10px 12px;font-size:.82rem;pointer-events:none}
@@ -69,7 +69,7 @@
       .empty p{color:var(--ink-soft);max-width:26rem}
       .empty__hint{margin-top:16px;font-size:.8rem;color:var(--muted)}
 
-      .canvas{position:relative}
+      .canvas{position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform}
       .canvas svg.links{position:absolute;top:0;left:0;pointer-events:none}
       .node{position:absolute;width:128px;display:flex;flex-direction:column;align-items:center}
       .tcard{width:128px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
@@ -87,6 +87,10 @@
       .plus:active{transform:scale(.9)}
       .plus--right{top:34px;right:-12px}
       .plus--bottom{bottom:-12px;left:calc(50% - 12px)}
+      .plus--top{top:-12px;left:calc(50% - 12px)}
+      .zoomctl{position:absolute;right:14px;bottom:calc(14px + var(--safe-b));z-index:8;display:flex;flex-direction:column;gap:8px}
+      .zoomctl button{width:42px;height:42px;border-radius:50%;border:1px solid var(--line);background:var(--surface);color:var(--ink);font-size:1.3rem;line-height:1;box-shadow:var(--shadow-sm);display:flex;align-items:center;justify-content:center}
+      .zoomctl button:active{background:var(--paper)}
 
       .avatar{border-radius:50%;flex:none;object-fit:cover;display:inline-flex;align-items:center;justify-content:center}
       .avatar--photo{background:var(--line)}
@@ -172,6 +176,8 @@
       var KEY="naata.v2";
       var persistent=(function(){try{localStorage.setItem("naata.__t","1");localStorage.removeItem("naata.__t");return true;}catch(e){return false;}})();
       var state={people:[],unions:[],meId:null};
+      var tx=0,ty=0,scale=1,currentCanvas=null,lastLayout=null,viewReady=false,requestFit=false,gesturesAttached=false;
+      var MIN_SCALE=0.3,MAX_SCALE=2.6;
       function load(){
         if(!persistent)return;
         try{
@@ -231,6 +237,11 @@
         if(pu)pu.children.push(p.id);else state.unions.push({id:uid(),partners:[],children:[anchorId,p.id]});save();return p;}
       function addChild(anchorId,draft){var p=makePerson(draft);var u=primaryUnion(anchorId);
         if(u)u.children.push(p.id);else state.unions.push({id:uid(),partners:[anchorId],children:[p.id]});save();return p;}
+      function addParent(anchorId,draft){var pu=parentUnion(anchorId);
+        if(pu&&pu.partners.length>=2){toast(personById(anchorId).name+" already has two parents.");return null;}
+        var p=makePerson(draft);
+        if(pu)pu.partners.push(p.id);else state.unions.push({id:uid(),partners:[p.id],children:[anchorId]});
+        save();return p;}
       function updatePerson(id,draft){var i=state.people.findIndex(function(p){return p.id===id;});if(i<0)return null;state.people[i]=Object.assign({},state.people[i],draft,{updatedAt:Date.now()});save();return state.people[i];}
       function removePerson(id){
         state.people=state.people.filter(function(p){return p.id!==id;});
@@ -248,7 +259,7 @@
       function importBackup(file){var r=new FileReader();r.onload=function(){var d;try{d=JSON.parse(r.result);}catch(e){toast("That file isn't valid JSON.");return;}
         if(d.app!=="naata"||!Array.isArray(d.people)){toast("That isn't a Naata backup file.");return;}
         if(!confirm("Restoring replaces everyone currently in Naata on this device. Continue?"))return;
-        state.people=d.people||[];state.unions=d.unions||[];state.meId=d.meId||null;save();render();toast("Restored "+state.people.length+(state.people.length===1?" person.":" people."));};r.readAsText(file);}
+        state.people=d.people||[];state.unions=d.unions||[];state.meId=d.meId||null;save();renderFit();toast("Restored "+state.people.length+(state.people.length===1?" person.":" people."));};r.readAsText(file);}
 
       /* ===== Modal ===== */
       var modalRoot=document.getElementById("modalRoot");
@@ -335,10 +346,10 @@
       /* ===== Add flows ===== */
       function startFirst(){personForm({title:"Add the first person",
         ctx:"Start anywhere — yourself, or the eldest relative you know. You'll grow the tree out from here.",
-        onSave:function(d){addRoot(d);render();closeModal();}});}
+        onSave:function(d){addRoot(d);renderFit();closeModal();}});}
       function addAnother(){personForm({title:"Add another person",
         ctx:"This person starts a new, separate branch you can connect later.",
-        onSave:function(d){addRoot(d);render();closeModal();}});}
+        onSave:function(d){addRoot(d);renderFit();closeModal();}});}
       function openRightMenu(anchor){
         var body=el("div",{class:"choice"},
           el("button",{onclick:function(){openAdd("partner",anchor);}},el("span",{class:"choice__ic"},"♥"),
@@ -350,13 +361,15 @@
       function openAdd(mode,anchor){
         var title,ctx,suggest,hot=false;
         if(mode==="partner"){title="Add "+anchor.name+"'s partner";ctx="They'll be paired with "+anchor.name+"; children you add hang from the couple.";}
+        else if(mode==="parent"){title="Add "+anchor.name+"'s parent";ctx="They become "+anchor.name+"'s parent. Add the second parent with the ♥ button on the new card.";}
         else if(mode==="sibling"){title="Add a sibling of "+anchor.name;ctx="They share "+anchor.name+"'s parents. Set birth order so the tree shows who's older.";hot=true;
           suggest=(parentUnion(anchor.id)?parentUnion(anchor.id).children.length:1)+1;}
         else{title="Add "+anchor.name+"'s child";ctx="Set birth order so siblings line up oldest to youngest.";hot=true;
           suggest=(primaryUnion(anchor.id)?primaryUnion(anchor.id).children.length:0)+1;}
         personForm({title:title,ctx:ctx,suggestOrder:suggest,hotOrder:hot,onSave:function(d){
-          if(mode==="partner")addPartner(anchor.id,d);else if(mode==="sibling")addSibling(anchor.id,d);else addChild(anchor.id,d);
-          render();closeModal();}});
+          if(mode==="partner")addPartner(anchor.id,d);else if(mode==="parent")addParent(anchor.id,d);
+          else if(mode==="sibling")addSibling(anchor.id,d);else addChild(anchor.id,d);
+          renderFit();closeModal();}});
       }
 
       /* ===== Detail ===== */
@@ -416,6 +429,34 @@
         return {pos:pos,couples:couples,sibGroups:sibGroups,width:Math.max(maxX-minX+PAD*2,1),height:maxY+PAD*2};
       }
 
+      /* ===== Pan / zoom ===== */
+      function applyTransform(){if(currentCanvas)currentCanvas.style.transform="translate("+tx+"px,"+ty+"px) scale("+scale+")";}
+      function fitView(L){var st=document.getElementById("stage");var vw=st.clientWidth||window.innerWidth||360,vh=st.clientHeight||window.innerHeight||640;
+        var s=Math.min(vw/L.width,vh/L.height,1);if(!isFinite(s)||s<=0)s=1;s=Math.max(s,MIN_SCALE);scale=s;
+        tx=(vw-L.width*s)/2;ty=Math.max(16,(vh-L.height*s)/2);applyTransform();}
+      function zoomAt(factor,cx,cy){var st=document.getElementById("stage");if(cx==null){cx=(st.clientWidth||360)/2;cy=(st.clientHeight||640)/2;}
+        var ns=Math.min(MAX_SCALE,Math.max(MIN_SCALE,scale*factor));var wx=(cx-tx)/scale,wy=(cy-ty)/scale;tx=cx-wx*ns;ty=cy-wy*ns;scale=ns;applyTransform();}
+      function zoomControls(){return el("div",{class:"zoomctl"},
+        el("button",{"aria-label":"Zoom in",onclick:function(){zoomAt(1.2);}},"+"),
+        el("button",{"aria-label":"Zoom out",onclick:function(){zoomAt(1/1.2);}},"−"),
+        el("button",{"aria-label":"Fit to screen",onclick:function(){if(lastLayout)fitView(lastLayout);}},"⤢"));}
+      function attachGestures(){if(gesturesAttached)return;gesturesAttached=true;var st=document.getElementById("stage");
+        var pts=new Map(),startX=0,startY=0,panning=false,lastDist=0,lastMid=null;
+        st.addEventListener("pointerdown",function(e){pts.set(e.pointerId,{x:e.clientX,y:e.clientY});if(pts.size===1){startX=e.clientX;startY=e.clientY;panning=false;}});
+        st.addEventListener("pointermove",function(e){if(!pts.has(e.pointerId))return;var prev=pts.get(e.pointerId);pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
+          var arr=[];pts.forEach(function(v){arr.push(v);});
+          if(arr.length===1){if(!panning&&Math.abs(e.clientX-startX)+Math.abs(e.clientY-startY)>5)panning=true;
+            if(panning){tx+=e.clientX-prev.x;ty+=e.clientY-prev.y;applyTransform();e.preventDefault();}}
+          else if(arr.length>=2){var rect=st.getBoundingClientRect();var dx=arr[0].x-arr[1].x,dy=arr[0].y-arr[1].y;var dist=Math.sqrt(dx*dx+dy*dy);
+            var mid={x:(arr[0].x+arr[1].x)/2-rect.left,y:(arr[0].y+arr[1].y)/2-rect.top};
+            if(lastDist){var f=dist/lastDist;var ns=Math.min(MAX_SCALE,Math.max(MIN_SCALE,scale*f));var wx=(mid.x-tx)/scale,wy=(mid.y-ty)/scale;tx=mid.x-wx*ns;ty=mid.y-wy*ns;scale=ns;if(lastMid){tx+=mid.x-lastMid.x;ty+=mid.y-lastMid.y;}applyTransform();}
+            lastDist=dist;lastMid=mid;e.preventDefault();}});
+        function up(e){pts.delete(e.pointerId);if(pts.size<2){lastDist=0;lastMid=null;}if(pts.size===0)panning=false;}
+        st.addEventListener("pointerup",up);st.addEventListener("pointercancel",up);
+        st.addEventListener("wheel",function(e){e.preventDefault();var rect=st.getBoundingClientRect();var cx=e.clientX-rect.left,cy=e.clientY-rect.top;
+          if(e.ctrlKey)zoomAt(Math.exp(-e.deltaY*0.01),cx,cy);else{tx-=e.deltaX;ty-=e.deltaY;applyTransform();}},{passive:false});}
+      function renderFit(){requestFit=true;render();}
+
       /* ===== Render ===== */
       function line(svg,x1,y1,x2,y2){
         var d="M"+x1+" "+y1+(x1===x2?(" V"+y2):(y1===y2?(" H"+x2):(" L"+x2+" "+y2)));
@@ -430,6 +471,7 @@
             el("h1",{},"Start your family tree"),
             el("p",{},"Tap the plus to add the first person. Then grow it: a partner or sibling to the side, children below."),
             el("p",{class:"empty__hint"},"Everything stays on this device. Nothing is uploaded.")));
+          viewReady=false;requestFit=false;
           return;
         }
         var L=computeLayout();
@@ -453,9 +495,14 @@
             el("span",{class:"tcard__name"},p.name),p.nickname?el("span",{class:"tcard__sub"},"“"+p.nickname+"”"):null);
           var right=el("button",{class:"plus plus--right","aria-label":"Add partner or sibling",onclick:function(e){e.stopPropagation();openRightMenu(p);}},"+");
           var bottom=el("button",{class:"plus plus--bottom","aria-label":"Add child",onclick:function(e){e.stopPropagation();openAdd("child",p);}},"+");
-          canvas.appendChild(el("div",{class:"node",style:"left:"+pp.x+"px;top:"+pp.y+"px"},card,right,bottom));
+          var pcu=parentUnion(p.id);var parentCount=pcu?pcu.partners.length:0;
+          var top=parentCount<2?el("button",{class:"plus plus--top","aria-label":"Add parent",onclick:function(e){e.stopPropagation();openAdd("parent",p);}},"+"):null;
+          canvas.appendChild(el("div",{class:"node",style:"left:"+pp.x+"px;top:"+pp.y+"px"},card,right,bottom,top));
         });
+        lastLayout=L;currentCanvas=canvas;
         stage.appendChild(canvas);
+        stage.appendChild(zoomControls());
+        if(requestFit||!viewReady){fitView(L);viewReady=true;requestFit=false;}else{applyTransform();}
       }
       function renderTools(){
         var tools=document.getElementById("tools");tools.innerHTML="";if(!state.people.length)return;
@@ -467,7 +514,7 @@
       }
 
       document.addEventListener("keydown",function(e){if(e.key==="Escape")closeModal();});
-      load();render();
+      load();attachGestures();render();
     </script>
   </body>
 </html>
